@@ -1,0 +1,90 @@
+{
+  "schema": 1,
+  "name": "algolia",
+  "label": "Algolia",
+  "description": "Search indices — list them, search them, and refresh one from a feed the moment a record changes.",
+  "icon": "magnifying-glass",
+  "category": "package",
+  "version": "1.0.0",
+  "author": "scott@cookwithcarbon.com",
+  "homepage": "https://github.com/TheBananaStand/leo-algolia-mcp",
+  "descriptor": {
+    "host_api": 1,
+    "details": "An app's search index is a separate store that ingests on a schedule, so between a write and the next ingest a record is real everywhere except where people look for it. This lists what each index holds and when it last built, searches one to reproduce a query that failed, pushes individual records, and replaces a whole index from a JSON feed atomically. Every write waits for the index to publish before answering, so \"refreshed\" means the next search will find it.",
+    "use_cases": [
+      "A part was just created but the costing picker can't find it — refresh the index",
+      "Check when the parts index last built and whether anything is still pending",
+      "Run the exact search that came back empty, against the index that answered it"
+    ],
+    "tools": [
+      "list_indices",
+      "search",
+      "refresh_index",
+      "save_records",
+      "delete_records"
+    ],
+    "fields": [
+      {
+        "key": "algolia_app_id",
+        "label": "Application ID",
+        "field_type": "text",
+        "required": true,
+        "description": "From the Algolia dashboard, under Settings → API Keys."
+      },
+      {
+        "key": "algolia_admin_api_key",
+        "label": "Admin API Key",
+        "field_type": "password",
+        "required": true,
+        "description": "The key with write access. A Search-Only key lists and searches but cannot refresh anything — Algolia refuses it with \"Method not allowed with this API key\"."
+      },
+      {
+        "key": "algolia_feed_auth_user",
+        "label": "Feed username",
+        "field_type": "text",
+        "required": false,
+        "description": "Only if the feed a refresh pulls from is behind basic auth, as Proluxe's /algolia/* endpoints are."
+      },
+      {
+        "key": "algolia_feed_auth_pass",
+        "label": "Feed password",
+        "field_type": "password",
+        "required": false,
+        "description": "Paired with the username above."
+      }
+    ],
+    "entitlements": {
+      "settings_read": [
+        "algolia_app_id",
+        "algolia_admin_api_key",
+        "algolia_feed_auth_user",
+        "algolia_feed_auth_pass"
+      ],
+      "network": [
+        "algolia.net",
+        "algolianet.com",
+        "api.proluxe.com"
+      ],
+      "sends": [
+        {
+          "to": "algolia.net",
+          "classes": ["search_queries", "business_records"],
+          "purpose": "Search terms, and the records being indexed — which are whatever the configured feed returns (on this install, the ERP's part, customer, contact, vendor and catalog lists). Nothing from conversations, files or accounts is attached."
+        },
+        {
+          "to": "api.proluxe.com",
+          "classes": ["business_records"],
+          "purpose": "A GET against one of the ERP's own /algolia/* feed endpoints, to read the records a refresh then pushes. Read-only; nothing is sent to the ERP."
+        }
+      ]
+    }
+  },
+  "mcp": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "https://github.com/TheBananaStand/leo-algolia-mcp/archive/d96b3698fde8694b6a5638d7d6c8ea0c9649bb0d.tar.gz"
+    ]
+  }
+}
