@@ -129,7 +129,7 @@
     "command": "npx",
     "args": [
       "-y",
-      "https://github.com/TheBananaStand/leo-algolia-mcp/archive/d96b3698fde8694b6a5638d7d6c8ea0c9649bb0d.tar.gz"
+      "https://github.com/TheBananaStand/leo-algolia-mcp/archive/66bcc18d2821d1d4bf14833c468f15bb1ec98510.tar.gz"
     ]
   }
 }
