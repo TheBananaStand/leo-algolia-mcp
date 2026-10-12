@@ -51,6 +51,14 @@ const APP_ID = "algolia_app_id";
 const ADMIN_KEY = "algolia_admin_api_key";
 const FEED_USER = "algolia_feed_auth_user";
 const FEED_PASS = "algolia_feed_auth_pass";
+// A feed behind OAuth2 client credentials — the Proluxe gateway is one. A
+// static token would be simpler and wrong: these expire (24h on that gateway),
+// and the failure arrives as a 401 on the one call somebody made because
+// something was already missing from search.
+const FEED_OAUTH_URL = "algolia_feed_oauth_url";
+const FEED_OAUTH_ID = "algolia_feed_oauth_client_id";
+const FEED_OAUTH_SECRET = "algolia_feed_oauth_client_secret";
+const FEED_OAUTH_AUDIENCE = "algolia_feed_oauth_audience";
 
 // Algolia caps a batch at 1000 objects. Larger requests are rejected whole, so
 // a 40k-record feed has to arrive in chunks either way.
@@ -222,13 +230,81 @@ async function search({ index, query, hits_per_page, filters }) {
   };
 }
 
-/** Fetch a JSON array of records from `url`, with optional basic auth. */
+// One token, reused until it expires. Minting per call would be a second
+// round trip on every refresh and, on a gateway that rate-limits token
+// issuance, the thing that breaks under a burst.
+let tokenCache = null;
+
+/**
+ * An OAuth2 client-credentials access token for the feed, or `null` if no
+ * OAuth is configured.
+ *
+ * The 60s margin is not politeness: a token that expires between being read
+ * here and arriving at the gateway produces a 401 on a refresh that was
+ * otherwise correct, and the next attempt succeeds — an intermittent failure
+ * with no pattern anybody can see.
+ */
+export async function feedToken(deps = {}) {
+  const env = deps.env ?? process.env;
+  const now = deps.now ?? (() => Date.now());
+  const url = (env[FEED_OAUTH_URL] ?? "").trim();
+  const id = (env[FEED_OAUTH_ID] ?? "").trim();
+  const secret = (env[FEED_OAUTH_SECRET] ?? "").trim();
+  if (!url || !id || !secret) return null;
+  if (tokenCache && tokenCache.expires > now()) return tokenCache.token;
+
+  const body = {
+    client_id: id,
+    client_secret: secret,
+    grant_type: "client_credentials",
+  };
+  // Omitting the audience is the quiet one. Auth0 answers 200 with a real but
+  // *opaque* token, which the gateway then declines — and that reads exactly
+  // like a wrong secret.
+  const audience = (env[FEED_OAUTH_AUDIENCE] ?? "").trim();
+  if (audience) body.audience = audience;
+
+  const response = await (deps.fetch ?? fetch)(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  let payload;
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    payload = {};
+  }
+  if (!response.ok || !payload.access_token) {
+    throw new Error(
+      `Could not get a feed access token from ${url} (${response.status}). ` +
+        `Check ${FEED_OAUTH_ID} and ${FEED_OAUTH_SECRET}` +
+        (audience ? "." : `, and whether ${FEED_OAUTH_AUDIENCE} is required.`),
+    );
+  }
+  // An unreported lifetime falls back to an hour rather than to forever: a
+  // cached-forever token works until it doesn't and then never recovers.
+  const ttl = Number(payload.expires_in) > 0 ? Number(payload.expires_in) : 3600;
+  tokenCache = { token: payload.access_token, expires: now() + Math.max(ttl - 60, 0) * 1000 };
+  return tokenCache.token;
+}
+
+/** Fetch a JSON array of records from `url`, with whatever auth is configured. */
 async function fetchFeed(url, auth) {
   const headers = { Accept: "application/json" };
   const user = (process.env[FEED_USER] ?? "").trim();
   const pass = (process.env[FEED_PASS] ?? "").trim();
-  if (auth !== false && user && pass) {
-    headers.Authorization = "Basic " + Buffer.from(`${user}:${pass}`).toString("base64");
+  if (auth !== false) {
+    // OAuth wins when both are configured — a gateway that issues tokens is
+    // not also going to accept the basic-auth pair, and sending the weaker one
+    // would make the refusal look like a credential problem rather than a
+    // configuration one.
+    const token = await feedToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    else if (user && pass) {
+      headers.Authorization = "Basic " + Buffer.from(`${user}:${pass}`).toString("base64");
+    }
   }
   const response = await fetch(url, { headers });
   if (!response.ok) {
@@ -236,8 +312,9 @@ async function fetchFeed(url, auth) {
     throw new Error(
       `Feed ${url} returned ${response.status}. ` +
         (response.status === 401 || response.status === 403
-          ? `It needs credentials this package does not have — set ${FEED_USER} ` +
-            `and ${FEED_PASS}, or point at a feed that does not require them.`
+          ? `It needs credentials this package does not have — set ` +
+            `${FEED_OAUTH_URL}/${FEED_OAUTH_ID}/${FEED_OAUTH_SECRET} for an OAuth ` +
+            `gateway, or ${FEED_USER} and ${FEED_PASS} for basic auth.`
           : detail.slice(0, 200)),
     );
   }
@@ -506,6 +583,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   }
 });
+
+/** Test seam — the token cache is module state and a suite must be able to clear it. */
+export function __resetTokenCache() {
+  tokenCache = null;
+}
 
 export { TOOLS, credentials, fetchFeed };
 

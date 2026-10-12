@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 process.env.LEO_MCP_NO_SERVE = "1";
 
 const mod = await import("./index.js");
-const { TOOLS, credentials, fetchFeed, waitForTask, withObjectIds } = mod;
+const { TOOLS, credentials, fetchFeed, waitForTask, withObjectIds, feedToken, __resetTokenCache } = mod;
 
 let failures = 0;
 const results = [];
@@ -227,6 +227,130 @@ await test("a feed that is not a list of records says so", async () => {
     stub.restore();
   }
 });
+
+// ── Feed OAuth ─────────────────────────────────────────────────────────────
+//
+// The Proluxe gateway issues client-credentials tokens and refuses basic auth,
+// so this is the path the one real install actually takes.
+
+const OAUTH_ENV = {
+  algolia_feed_oauth_url: "https://x.auth0.com/oauth/token",
+  algolia_feed_oauth_client_id: "cid",
+  algolia_feed_oauth_client_secret: "csec",
+  algolia_feed_oauth_audience: "https://portal.example.com",
+};
+
+await test("no OAuth configured is null, not an error", async () => {
+  __resetTokenCache();
+  assert.equal(await feedToken({ env: {} }), null);
+});
+
+await test("the audience is sent when configured", async () => {
+  __resetTokenCache();
+  let sentBody;
+  const token = await feedToken({
+    env: OAUTH_ENV,
+    now: () => 0,
+    fetch: async (_u, init) => {
+      sentBody = JSON.parse(init.body);
+      return new Response(JSON.stringify({ access_token: "tok", expires_in: 86400 }), { status: 200 });
+    },
+  });
+  assert.equal(token, "tok");
+  assert.equal(sentBody.grant_type, "client_credentials");
+  // Omit it and Auth0 answers 200 with a real but *opaque* token, which the
+  // gateway then declines — and that reads exactly like a wrong secret.
+  assert.equal(sentBody.audience, "https://portal.example.com");
+});
+
+await test("the token is cached until just before it expires", async () => {
+  __resetTokenCache();
+  let minted = 0;
+  let clock = 0;
+  const deps = () => ({
+    env: OAUTH_ENV,
+    now: () => clock,
+    fetch: async () => {
+      minted += 1;
+      return new Response(JSON.stringify({ access_token: `t${minted}`, expires_in: 3600 }), { status: 200 });
+    },
+  });
+  assert.equal(await feedToken(deps()), "t1");
+  clock = 3_000_000; // still inside the hour
+  assert.equal(await feedToken(deps()), "t1", "a live token must be reused");
+  assert.equal(minted, 1);
+  // The 60s margin: a token that expires between being read and arriving at
+  // the gateway is a 401 on an otherwise correct refresh, and the retry works
+  // — an intermittent failure with no pattern anybody can see.
+  clock = 3_541_000; // 3600 - 60 + 1s
+  assert.equal(await feedToken(deps()), "t2");
+});
+
+await test("an unreported lifetime falls back to an hour, not to forever", async () => {
+  __resetTokenCache();
+  let minted = 0;
+  let clock = 0;
+  const deps = () => ({
+    env: OAUTH_ENV,
+    now: () => clock,
+    fetch: async () => {
+      minted += 1;
+      return new Response(JSON.stringify({ access_token: `t${minted}` }), { status: 200 });
+    },
+  });
+  await feedToken(deps());
+  clock = 3_541_000;
+  await feedToken(deps());
+  // Cached forever works until it doesn't, and then never recovers.
+  assert.equal(minted, 2);
+});
+
+await test("a 200 with no access_token raises rather than returning nothing", async () => {
+  __resetTokenCache();
+  await assert.rejects(
+    feedToken({
+      env: OAUTH_ENV,
+      now: () => 0,
+      fetch: async () => new Response(JSON.stringify({ scope: "read" }), { status: 200 }),
+    }),
+    /Could not get a feed access token/,
+  );
+});
+
+await test("OAuth wins over basic auth when both are set", () =>
+  withEnv({ ...OAUTH_ENV, algolia_feed_auth_user: "u", algolia_feed_auth_pass: "p" }, async () => {
+    __resetTokenCache();
+    const stub = stubFetch([
+      { match: "oauth/token", body: { access_token: "tok", expires_in: 3600 } },
+      { match: "/feed", body: [{ objectID: "1" }] },
+    ]);
+    try {
+      await fetchFeed("https://x/feed");
+      const feedReq = stub.seen.find((r) => r.url.includes("/feed"));
+      // A gateway that issues tokens is not also going to accept the basic
+      // pair, and sending the weaker one makes the refusal look like a bad
+      // credential rather than a misconfiguration.
+      assert.equal(feedReq.headers.Authorization, "Bearer tok");
+    } finally {
+      stub.restore();
+      __resetTokenCache();
+    }
+  }));
+
+await test("feed_auth:false sends no token either", () =>
+  withEnv(OAUTH_ENV, async () => {
+    __resetTokenCache();
+    const stub = stubFetch([{ match: "/feed", body: [{ objectID: "1" }] }]);
+    try {
+      await fetchFeed("https://x/feed", false);
+      assert.equal(stub.seen[0].headers.Authorization, undefined);
+      assert.equal(stub.seen.filter((r) => r.url.includes("oauth")).length, 0,
+                   "no token should even be minted");
+    } finally {
+      stub.restore();
+      __resetTokenCache();
+    }
+  }));
 
 // ── refresh_index ──────────────────────────────────────────────────────────
 
