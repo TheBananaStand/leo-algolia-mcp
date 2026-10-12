@@ -1,7 +1,8 @@
 # leo-algolia-mcp
 
-Algolia search indices as a Leo package, over MCP — list them, search them,
-refresh one from a feed, and upsert or delete individual records.
+Algolia as a Leo package, over MCP — run the Connectors ingestion task that
+feeds an index and wait for the outcome, and list, search, refresh and edit the
+indices themselves.
 
 ## Why this exists
 
@@ -18,20 +19,62 @@ the index is just behind.
 The ERP has six endpoints that **produce** index payloads —
 
 ```
-GET /algolia/parts      → part_costs
-GET /algolia/catalog    → catalog
-GET /algolia/customers  → customers
-GET /algolia/contacts   → contacts
-GET /algolia/vendors    → vendor
-GET /algolia/products   → products
+GET /Common/algolia/parts      → part_costs
+GET /Common/algolia/catalog    → catalog
+GET /Common/algolia/customers  → customers
+GET /Common/algolia/contacts   → contacts
+GET /Common/algolia/vendors    → vendor
+GET /Common/algolia/products   → products
 ```
 
 — and nothing anywhere that pushes one. Its Go helper
 (`shared/services/algolia.go`) is `NewAlgoliaClient` / `GetIndex` /
-`SearchIndex`: search only, no write. So there was no reindex to ask for, and
-"wait for the next sync" was the whole remedy.
+`SearchIndex`: search only, no write. So there was no reindex endpoint to ask
+for, and "wait for the next sync" was the whole remedy.
+
+The sync itself is an **Algolia Connectors task** on the Algolia side, not in
+the ERP — which is why it is invisible from the ERP source, and why the first
+version of this package reached for the feed. Running that task is the better
+answer, and `list_tasks` / `run_task` are how.
 
 ## Tools
+
+### The connector half — prefer this
+
+Algolia Connectors tasks are the configured pipeline: a source, a transformation,
+a destination index, a schedule. On the Proluxe install there is already a
+**Full reindexing** task from source `parts` into `part_costs`, running about
+hourly. When an index has a task, running that task is the right way to refresh
+it — `refresh_index` below pushes records straight past the pipeline, knows
+nothing about the transformation it applies, and is overwritten by the next
+scheduled run.
+
+| Tool | |
+|---|---|
+| `list_tasks` | Every ingestion task: what it pulls from, which index it writes, enabled, schedule, last run and next run. Start here when a record exists in the source and search cannot find it — a `last_run` older than the record is the whole answer. |
+| `run_task` | Trigger a task now and **wait for the run to finish**, then say whether it succeeded. |
+| `run_status` | Where a run got to, by `run_id` — for one that outlasted `run_task`'s wait. |
+
+Three things about runs that are reported distinctly, because conflating them is
+how a stale index gets declared fresh:
+
+- **`finished` + `outcome: success`** — done, go and look.
+- **`finished` + `outcome: failure`** — the run ran and failed, with the reason.
+  `status` alone says nothing about this.
+- **`skipped`** — the connector decided there was nothing to ingest. The index
+  was **not** rebuilt.
+- **Still running past `wait_seconds`** — not a failure. The run is real and has
+  a `run_id`; triggering a second one on top of the first is the wrong response.
+
+**Two API quirks worth knowing**, both of which answer 404 when you get them
+wrong — which reads exactly like "there is no such task":
+
+- Tasks are `/2/tasks`; runs, sources and destinations are `/1/`.
+- Ingestion is **regional** (`data.us.algolia.com` / `data.eu.algolia.com`),
+  unlike the Search API. Set `algolia_region`, or leave it blank and the first
+  call probes both and remembers.
+
+### The index half
 
 | Tool | |
 |---|---|
@@ -41,11 +84,26 @@ GET /algolia/products   → products
 | `save_records` | Upsert specific records. The narrow path for one newly created record — far cheaper than replacing a whole index, and the right call right after something is added by API. |
 | `delete_records` | Remove records by objectID. |
 
-So the Proluxe case is one call:
+So the Proluxe case is one call — and, now that the connector task is reachable,
+the better one:
 
 ```
-refresh_index  index=part_costs  feed_url=https://api.proluxe.com/algolia/parts
+list_tasks                        → find the part_costs task
+run_task  task_id=<that>          → trigger it and wait for the outcome
 ```
+
+The feed path remains for an index with no task, or when the connector itself is
+what is broken:
+
+```
+refresh_index  index=part_costs  feed_url=https://api.proluxe.com/Common/algolia/parts
+```
+
+Note the **`/Common`** prefix. The bare `/algolia/parts` answers `404 {"error":
+"Unknown app: algolia"}` with a valid token, and `401` without one — two
+different wrong answers for the same wrong path. Auth is an Auth0
+client-credentials Bearer, not the `ALGOLIA_AUTH_USER`/`PASS` basic pair in the
+service `.env` files.
 
 ### Every write waits for the index to publish
 
@@ -100,6 +158,7 @@ to agree or the credential silently never arrives.
 |---|---|
 | `algolia_app_id` | required |
 | `algolia_admin_api_key` | required — the key with **write** access. A search-only key lists and searches but cannot refresh anything, and Algolia refuses it with "Method not allowed with this API key". |
+| `algolia_region` | optional — `us` or `eu`, for the Ingestion API. Blank probes both. |
 | `algolia_feed_auth_user` | optional — basic auth for `refresh_index`'s feed, when the feed is protected (Proluxe's `/algolia/*` are) |
 | `algolia_feed_auth_pass` | optional |
 

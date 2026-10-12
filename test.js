@@ -11,7 +11,8 @@ import assert from "node:assert/strict";
 process.env.LEO_MCP_NO_SERVE = "1";
 
 const mod = await import("./index.js");
-const { TOOLS, credentials, fetchFeed, waitForTask, withObjectIds, feedToken, __resetTokenCache } = mod;
+const { TOOLS, credentials, fetchFeed, waitForTask, withObjectIds, feedToken,
+        __resetTokenCache, __resetRegionCache } = mod;
 
 let failures = 0;
 const results = [];
@@ -618,14 +619,246 @@ await test("every tool declares its required arguments", () => {
   // A tool with a schema that requires nothing is one the model calls with
   // nothing, and `undefined` interpolated into a URL is the literal text
   // "undefined" — which Algolia honours as a real index name.
+  //
+  // The two listings take no subject at all; the ingestion tools are addressed
+  // by task and run rather than by index. Spelling that out beats loosening
+  // the rule to "requires something", which would pass for a tool that asked
+  // for the wrong thing.
+  const SUBJECT = {
+    list_tasks: null,
+    list_indices: null,
+    run_task: "task_id",
+    run_status: "run_id",
+    search: "index",
+    refresh_index: "index",
+    save_records: "index",
+    delete_records: "index",
+  };
+  assert.deepEqual(Object.keys(TOOLS).sort(), Object.keys(SUBJECT).sort(),
+                   "a tool was added or removed without saying what addresses it");
   for (const [name, t] of Object.entries(TOOLS)) {
     assert.ok(t.description.length > 40, `${name} has no useful description`);
     assert.equal(t.inputSchema.type, "object", `${name} has no object schema`);
-    if (name === "list_indices") continue;
-    assert.ok(Array.isArray(t.inputSchema.required) && t.inputSchema.required.includes("index"),
-              `${name} does not require \`index\``);
+    const subject = SUBJECT[name];
+    if (subject === null) continue;
+    assert.ok(Array.isArray(t.inputSchema.required) && t.inputSchema.required.includes(subject),
+              `${name} does not require \`${subject}\``);
   }
 });
+
+// ── Ingestion: tasks and runs ──────────────────────────────────────────────
+//
+// A Connectors task is the configured pipeline — source, transformation,
+// destination, schedule. Running one is the right way to rebuild an index that
+// has a task, because pushing records past it is overwritten by the next
+// scheduled run.
+
+function ingestStub(handlers) {
+  __resetRegionCache();
+  return stubFetch(handlers);
+}
+
+await test("tasks are /2/ and runs are /1/", () =>
+  withEnv({ algolia_region: "us" }, async () => {
+    // Algolia's own asymmetry, easy to assume away, and the wrong version
+    // answers 404 — which reads exactly like "there are no tasks".
+    const stub = ingestStub([
+      { match: "/2/tasks/abc/run", method: "POST", body: { runID: "r1" } },
+      { match: "/1/runs/r1", body: { status: "finished", outcome: "success" } },
+    ]);
+    try {
+      const out = await TOOLS.run_task.run({ task_id: "abc" }, { sleep: async () => {} });
+      assert.equal(out.run_id, "r1");
+      assert.match(stub.seen[0].url, /\/2\/tasks\/abc\/run$/);
+      assert.match(stub.seen[1].url, /\/1\/runs\/r1$/);
+      assert.match(stub.seen[0].url, /^https:\/\/data\.us\.algolia\.com/);
+    } finally {
+      stub.restore();
+      __resetRegionCache();
+    }
+  }));
+
+await test("run_task waits for the run and reports the outcome", () =>
+  withEnv({ algolia_region: "us" }, async () => {
+    let polls = 0;
+    const real = globalThis.fetch;
+    __resetRegionCache();
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      // `/tasks/.../run`, not `/run` — `/1/runs/r9` contains that too, and
+      // matching it fed the poll a runID with no status forever.
+      if (u.includes("/tasks/")) {
+        return new Response(JSON.stringify({ runID: "r9" }), { status: 200 });
+      }
+      polls += 1;
+      // Answering at the runID would report "reindexed" while the index is
+      // exactly as stale as it was — the bug this package exists to stop,
+      // one layer up.
+      const status = polls < 3 ? "started" : "finished";
+      return new Response(JSON.stringify({ status, outcome: "success" }), { status: 200 });
+    };
+    try {
+      const out = await TOOLS.run_task.run({ task_id: "t" }, { sleep: async () => {} });
+      assert.equal(polls, 3, "should have kept polling until the run finished");
+      assert.equal(out.status, "finished");
+      assert.equal(out.searchable, true);
+    } finally {
+      globalThis.fetch = real;
+      __resetRegionCache();
+    }
+  }));
+
+await test("a failed run is reported as a failure, with the reason", () =>
+  withEnv({ algolia_region: "us" }, async () => {
+    const stub = ingestStub([
+      { match: "/run", method: "POST", body: { runID: "r2" } },
+      { match: "/1/runs/", body: { status: "finished", outcome: "failure", reason: "source timeout" } },
+    ]);
+    try {
+      const out = await TOOLS.run_task.run({ task_id: "t" }, { sleep: async () => {} });
+      // `status: finished` alone is not success. Reading only the status is
+      // how a failed reindex gets reported as a refreshed index.
+      assert.equal(out.searchable, false);
+      assert.match(out.note, /FAILED/);
+      assert.match(out.note, /source timeout/);
+    } finally {
+      stub.restore();
+      __resetRegionCache();
+    }
+  }));
+
+await test("a skipped run says the index was not rebuilt", () =>
+  withEnv({ algolia_region: "us" }, async () => {
+    const stub = ingestStub([
+      { match: "/run", method: "POST", body: { runID: "r3" } },
+      { match: "/1/runs/", body: { status: "skipped" } },
+    ]);
+    try {
+      const out = await TOOLS.run_task.run({ task_id: "t" }, { sleep: async () => {} });
+      // The connector decided there was nothing to do. Reporting that as done
+      // is how somebody concludes the index was refreshed when it was
+      // deliberately left alone.
+      assert.match(out.note, /NOT rebuilt/);
+    } finally {
+      stub.restore();
+      __resetRegionCache();
+    }
+  }));
+
+await test("a run that outlasts the wait is still running, not failed", () =>
+  withEnv({ algolia_region: "us" }, async () => {
+    const stub = ingestStub([
+      { match: "/run", method: "POST", body: { runID: "r4" } },
+      { match: "/1/runs/", body: { status: "started" } },
+    ]);
+    try {
+      let clock = 0;
+      const out = await TOOLS.run_task.run(
+        { task_id: "t", wait_seconds: 5 },
+        { sleep: async () => { clock += 3000; }, now: () => clock },
+      );
+      // Saying "failed" here sends somebody to trigger a second run on top of
+      // the first.
+      assert.equal(out.status, "started");
+      assert.equal(out.searchable, false);
+      assert.equal(out.run_id, "r4");
+      assert.match(out.note, /Still running/);
+      assert.match(out.note, /rather than triggering it again/);
+    } finally {
+      stub.restore();
+      __resetRegionCache();
+    }
+  }));
+
+await test("a run with no runID raises rather than returning something unfollowable", () =>
+  withEnv({ algolia_region: "us" }, async () => {
+    const stub = ingestStub([{ match: "/run", method: "POST", body: { createdAt: "now" } }]);
+    try {
+      await assert.rejects(
+        TOOLS.run_task.run({ task_id: "t" }, { sleep: async () => {} }),
+        /no runID/,
+      );
+    } finally {
+      stub.restore();
+      __resetRegionCache();
+    }
+  }));
+
+await test("the region is probed when unset, and only on 401/404", () =>
+  withEnv({ algolia_region: undefined }, async () => {
+    const stub = ingestStub([
+      { match: "data.us.algolia.com", status: 404, body: { message: "not found" } },
+      { match: "data.eu.algolia.com/2/tasks", body: { tasks: [] } },
+      { match: "data.eu.algolia.com/1/", body: { sources: [], destinations: [] } },
+    ]);
+    try {
+      const out = await TOOLS.list_tasks.run({});
+      assert.equal(out.region, "eu");
+      // Asking the wrong region answers as though the task does not exist,
+      // which reads as "somebody deleted it" rather than "wrong host".
+      assert.ok(stub.seen[0].url.includes("data.us."));
+    } finally {
+      stub.restore();
+      __resetRegionCache();
+    }
+  }));
+
+await test("a 500 stops the probe instead of blaming the region", () =>
+  withEnv({ algolia_region: undefined }, async () => {
+    const stub = ingestStub([{ match: "data.us.", status: 500, body: { message: "boom" } }]);
+    try {
+      // An outage is not evidence about the region, and reporting "no
+      // ingestion in either region" for one sends somebody to the wrong page.
+      await assert.rejects(TOOLS.list_tasks.run({}), /returned 500/);
+      assert.equal(stub.seen.filter((r) => r.url.includes("data.eu.")).length, 0);
+    } finally {
+      stub.restore();
+      __resetRegionCache();
+    }
+  }));
+
+await test("list_tasks names its source and destination, not just UUIDs", () =>
+  withEnv({ algolia_region: "us" }, async () => {
+    const stub = ingestStub([
+      { match: "/2/tasks", body: { tasks: [{
+          taskID: "t1", enabled: true, action: "replace",
+          sourceID: "s-uuid", destinationID: "d-uuid",
+          trigger: { type: "schedule", cron: "0 * * * *", lastRun: "A", nextRun: "B" },
+      }] } },
+      { match: "/1/sources", body: { sources: [{ sourceID: "s-uuid", name: "parts" }] } },
+      { match: "/1/destinations", body: { destinations: [{ destinationID: "d-uuid", name: "Index part_costs" }] } },
+    ]);
+    try {
+      const out = await TOOLS.list_tasks.run({});
+      const t = out.tasks[0];
+      // A task reported as three UUIDs is one somebody has to open the
+      // dashboard to identify, which is the thing this replaces.
+      assert.equal(t.source, "parts");
+      assert.equal(t.destination, "Index part_costs");
+      assert.equal(t.cron, "0 * * * *");
+      assert.equal(t.next_run, "B");
+    } finally {
+      stub.restore();
+      __resetRegionCache();
+    }
+  }));
+
+await test("a key that cannot read sources still lists tasks", () =>
+  withEnv({ algolia_region: "us" }, async () => {
+    const stub = ingestStub([
+      { match: "/2/tasks", body: { tasks: [{ taskID: "t1", sourceID: "s", destinationID: "d" }] } },
+      { match: "/1/", status: 403, body: { message: "nope" } },
+    ]);
+    try {
+      // Losing the friendly name is not worth losing the list.
+      const out = await TOOLS.list_tasks.run({});
+      assert.equal(out.tasks[0].task_id, "t1");
+      assert.equal(out.tasks[0].source, "s");
+    } finally {
+      stub.restore();
+      __resetRegionCache();
+    }
+  }));
 
 console.log(results.join("\n"));
 console.log(failures ? `\n${failures} failing` : `\n${results.length} passing`);

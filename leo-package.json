@@ -10,13 +10,16 @@
   "homepage": "https://github.com/TheBananaStand/leo-algolia-mcp",
   "descriptor": {
     "host_api": 1,
-    "details": "An app's search index is a separate store that ingests on a schedule, so between a write and the next ingest a record is real everywhere except where people look for it. This lists what each index holds and when it last built, searches one to reproduce a query that failed, pushes individual records, and replaces a whole index from a JSON feed atomically. Every write waits for the index to publish before answering, so \"refreshed\" means the next search will find it.",
+    "details": "An app's search index is a separate store that ingests on a schedule, so between a write and the next ingest a record is real everywhere except where people look for it. This lists the Algolia Connectors tasks that feed each index and runs one on demand \u2014 waiting for the run to finish and saying whether it succeeded \u2014 which is how an index gets rebuilt the way somebody configured it. It also lists and searches indices directly, pushes individual records, and can replace a whole index from a JSON feed when there is no connector task for it.",
     "use_cases": [
-      "A part was just created but the costing picker can't find it \u2014 refresh the index",
-      "Check when the parts index last built and whether anything is still pending",
+      "A part was just created but the costing picker can't find it \u2014 run the reindexing task now",
+      "Check when the parts task last ran and when it next runs",
       "Run the exact search that came back empty, against the index that answered it"
     ],
     "tools": [
+      "list_tasks",
+      "run_task",
+      "run_status",
       "list_indices",
       "search",
       "refresh_index",
@@ -37,6 +40,13 @@
         "field_type": "password",
         "required": true,
         "description": "The key with write access. A Search-Only key lists and searches but cannot refresh anything \u2014 Algolia refuses it with \"Method not allowed with this API key\"."
+      },
+      {
+        "key": "algolia_region",
+        "label": "Ingestion region",
+        "field_type": "text",
+        "required": false,
+        "description": "us or eu \u2014 where this application's Connectors data lives. Leave blank to probe both; asking the wrong region answers as though the task does not exist."
       },
       {
         "key": "algolia_feed_auth_user",
@@ -85,6 +95,7 @@
       "settings_read": [
         "algolia_app_id",
         "algolia_admin_api_key",
+        "algolia_region",
         "algolia_feed_auth_user",
         "algolia_feed_auth_pass",
         "algolia_feed_oauth_url",
@@ -95,6 +106,8 @@
       "network": [
         "algolia.net",
         "algolianet.com",
+        "data.us.algolia.com",
+        "data.eu.algolia.com",
         "api.proluxe.com",
         "proluxe-portal.auth0.com"
       ],
@@ -106,6 +119,13 @@
             "business_records"
           ],
           "purpose": "Search terms, and the records being indexed \u2014 which are whatever the configured feed returns (on this install, the ERP's part, customer, contact, vendor and catalog lists). Nothing from conversations, files or accounts is attached."
+        },
+        {
+          "to": "data.{us,eu}.algolia.com",
+          "classes": [
+            "search_queries"
+          ],
+          "purpose": "Listing the configured ingestion tasks and triggering one by id. No records travel this way \u2014 the connector reads its own source."
         },
         {
           "to": "api.proluxe.com",
@@ -129,7 +149,7 @@
     "command": "npx",
     "args": [
       "-y",
-      "https://github.com/TheBananaStand/leo-algolia-mcp/archive/29dd25ce085450087e0aa69f460aec39b91b6d6e.tar.gz"
+      "https://github.com/TheBananaStand/leo-algolia-mcp/archive/d96b3698fde8694b6a5638d7d6c8ea0c9649bb0d.tar.gz"
     ]
   }
 }

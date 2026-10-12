@@ -59,6 +59,15 @@ const FEED_OAUTH_URL = "algolia_feed_oauth_url";
 const FEED_OAUTH_ID = "algolia_feed_oauth_client_id";
 const FEED_OAUTH_SECRET = "algolia_feed_oauth_client_secret";
 const FEED_OAUTH_AUDIENCE = "algolia_feed_oauth_audience";
+// Where this application's Ingestion (Connectors) data lives. Unlike the
+// Search API, which is reachable at one host per application, ingestion is
+// regional and a call to the wrong region answers as though the task simply
+// does not exist.
+const REGION = "algolia_region";
+
+// The Ingestion API's regions. Probed in this order when none is configured —
+// see `ingestionHost`.
+const REGIONS = ["us", "eu"];
 
 // Algolia caps a batch at 1000 objects. Larger requests are rejected whole, so
 // a 40k-record feed has to arrive in chunks either way.
@@ -190,6 +199,228 @@ async function batchInto(creds, index, records, action) {
     written += chunk.length;
   }
   return written;
+}
+
+// ---------------------------------------------------------------------------
+// Ingestion — the Connectors pipeline, which is a different API on a different
+// host from everything above.
+//
+// A Connectors task is a configured pipeline: a source, a destination index, a
+// transformation, and a schedule. On the one install this was built for there
+// is already a "Full reindexing" task from source `parts` into `part_costs`
+// running about hourly — so the right answer to "a part was created and search
+// cannot see it" is to run THAT, not to push records past it. `refresh_index`
+// replaces an index from a feed and knows nothing about the transformation the
+// connector applies; running the task uses the pipeline somebody configured,
+// and the next scheduled run agrees with it instead of overwriting it.
+// ---------------------------------------------------------------------------
+
+/**
+ * The ingestion host for this application.
+ *
+ * **Regional, unlike the Search API.** `data.us.algolia.com` and
+ * `data.eu.algolia.com` are separate; asking the wrong one about a task
+ * answers as though the task does not exist, which reads as "somebody deleted
+ * it" rather than "wrong host". Configuring `algolia_region` skips the probe;
+ * without it the first call tries each in turn and remembers which answered,
+ * so the cost is paid once per process and the answer names the region it
+ * found.
+ */
+let regionCache = null;
+export function __resetRegionCache() {
+  regionCache = null;
+}
+
+function ingestionHost(region) {
+  return `https://data.${region}.algolia.com`;
+}
+
+/** One Ingestion REST call against `region`. */
+async function ingestCall({ appId, apiKey }, region, { method = "GET", path, body }) {
+  const response = await fetch(`${ingestionHost(region)}${path}`, {
+    method,
+    headers: {
+      "x-algolia-application-id": appId,
+      "x-algolia-api-key": apiKey,
+      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  const text = await response.text();
+  let payload;
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    payload = { message: text.slice(0, 300) };
+  }
+  if (!response.ok) {
+    const err = new Error(
+      `Algolia ingestion ${method} ${path} returned ${response.status}: ` +
+        `${payload?.message ?? text.slice(0, 200)}`,
+    );
+    err.status = response.status;
+    throw err;
+  }
+  return payload;
+}
+
+/**
+ * Call the Ingestion API, resolving the region first.
+ *
+ * A configured region is used as given and its failures are reported as
+ * failures. An unconfigured one is probed, and only a 401/404 moves on to the
+ * next candidate — a 500 or a network fault is not evidence about the region,
+ * and treating it as such would report "no ingestion in either region" for an
+ * Algolia outage.
+ */
+async function ingest(creds, opts, deps = {}) {
+  const env = deps.env ?? process.env;
+  const configured = (env[REGION] ?? "").trim().toLowerCase();
+  if (configured) return { region: configured, body: await ingestCall(creds, configured, opts) };
+  if (regionCache) return { region: regionCache, body: await ingestCall(creds, regionCache, opts) };
+
+  let last = null;
+  for (const region of REGIONS) {
+    try {
+      const body = await ingestCall(creds, region, opts);
+      regionCache = region;
+      return { region, body };
+    } catch (error) {
+      if (error.status !== 401 && error.status !== 404) throw error;
+      last = error;
+    }
+  }
+  throw new Error(
+    `No Algolia ingestion data in ${REGIONS.join(" or ")} for this application. ` +
+      `Set ${REGION} if it lives elsewhere, or check the key has the ingestion ACL ` +
+      `(addObject, deleteIndex, editSettings). Last answer: ${last?.message ?? "none"}`,
+  );
+}
+
+async function listTasks({ enabled }) {
+  const creds = credentials();
+  const params = new URLSearchParams({ itemsPerPage: "100", sort: "updatedAt", order: "desc" });
+  if (enabled !== undefined) params.set("enabled", String(enabled));
+  // Tasks are `/2/`; runs, sources and destinations below are `/1/`. That
+  // asymmetry is Algolia's, it is easy to assume away, and the wrong version
+  // answers 404 — which reads exactly like "there are no tasks".
+  const { region, body } = await ingest(creds, { path: `/2/tasks?${params}` });
+
+  // Names, not just UUIDs. A task reported as three UUIDs is one somebody has
+  // to go to the dashboard to identify, which is the thing this replaces.
+  const names = new Map();
+  for (const kind of ["sources", "destinations"]) {
+    try {
+      const { body: list } = await ingest(creds, { path: `/1/${kind}?itemsPerPage=100` });
+      for (const item of list?.[kind] ?? []) {
+        names.set(item.sourceID ?? item.destinationID, item.name);
+      }
+    } catch {
+      // A key without read on sources still runs tasks. Losing the friendly
+      // name is not worth losing the list.
+    }
+  }
+
+  return {
+    region,
+    tasks: (body?.tasks ?? []).map((t) => ({
+      task_id: t.taskID,
+      enabled: t.enabled,
+      action: t.action,
+      trigger: t.trigger?.type ?? t.triggerType,
+      cron: t.trigger?.cron ?? t.cron ?? null,
+      last_run: t.trigger?.lastRun ?? t.lastRun ?? null,
+      next_run: t.trigger?.nextRun ?? t.nextRun ?? null,
+      source: names.get(t.sourceID) ?? t.sourceID,
+      destination: names.get(t.destinationID) ?? t.destinationID,
+    })),
+  };
+}
+
+async function runStatus({ run_id }) {
+  if (!run_id) throw new Error("run_status requires `run_id`.");
+  const creds = credentials();
+  // `/1/`, not `/2/` — see the note in `listTasks`.
+  const { region, body } = await ingest(creds, {
+    path: `/1/runs/${encodeURIComponent(run_id)}`,
+  });
+  return { region, run_id, ...summariseRun(body) };
+}
+
+/** The half of a run worth reporting, in the vocabulary the docs use. */
+function summariseRun(run) {
+  return {
+    status: run?.status ?? "unknown",
+    outcome: run?.outcome ?? null,
+    reason: run?.reason ?? null,
+    started_at: run?.startedAt ?? null,
+    finished_at: run?.finishedAt ?? null,
+    progress: run?.progress ?? null,
+  };
+}
+
+/**
+ * Trigger a task and wait for it to finish.
+ *
+ * The wait is the same bargain as every write in this file: `POST /run`
+ * answers with a `runID` the instant the run is queued, and answering there
+ * would report "reindexed" while the index is still exactly as stale as it was
+ * — which is the bug this whole package exists to stop, restated one layer up.
+ *
+ * A run that outlasts the budget is **not** an error. It is real, it is still
+ * going, and it has a `run_id` to ask about — saying "failed" there would send
+ * somebody to trigger a second run on top of the first.
+ */
+async function runTask({ task_id, wait_seconds }, deps = {}) {
+  if (!task_id) throw new Error("run_task requires `task_id`. Use list_tasks to find it.");
+  const creds = credentials();
+  const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const now = deps.now ?? (() => Date.now());
+
+  const { region, body: started } = await ingest(creds, {
+    method: "POST",
+    path: `/2/tasks/${encodeURIComponent(task_id)}/run`,
+    body: { runMetadata: { triggeredBy: "leo" } },
+  });
+  const runId = started?.runID;
+  if (!runId) {
+    throw new Error(
+      `Algolia accepted the run but reported no runID, so there is nothing to follow. ` +
+        `Check the task in the dashboard before triggering it again.`,
+    );
+  }
+
+  const budgetMs = Math.max(0, (wait_seconds ?? 300)) * 1000;
+  const deadline = now() + budgetMs;
+  let run = null;
+  for (;;) {
+    if (now() >= deadline) break;
+    await sleep(deps.pollMs ?? 3000);
+    const { body } = await ingest(creds, { path: `/1/runs/${encodeURIComponent(runId)}` });
+    run = body;
+    if (run?.status === "finished" || run?.status === "skipped") break;
+  }
+
+  const summary = summariseRun(run ?? {});
+  // "skipped" is its own answer and not a success: the connector decided there
+  // was nothing to do. Reporting it as done is how somebody concludes the
+  // index was refreshed when it was deliberately left alone.
+  const done = summary.status === "finished" || summary.status === "skipped";
+  return {
+    region,
+    task_id,
+    run_id: runId,
+    ...summary,
+    searchable: done && summary.outcome !== "failure",
+    note: !done
+      ? `Still running after ${wait_seconds ?? 300}s. Nothing is wrong and nothing is lost — ` +
+        `ask run_status with this run_id rather than triggering it again.`
+      : summary.status === "skipped"
+        ? "The connector skipped this run — it decided there was nothing to ingest. The index was NOT rebuilt."
+        : summary.outcome === "failure"
+          ? `The run finished and FAILED: ${summary.reason ?? "no reason given"}. The index is unchanged.`
+          : "The run finished and succeeded — a search now will see what the source had.",
+  };
 }
 
 async function listIndices() {
@@ -473,6 +704,58 @@ async function deleteRecords({ index, object_ids }) {
 }
 
 const TOOLS = {
+  list_tasks: {
+    run: listTasks,
+    description:
+      "Every Algolia Connectors ingestion task on this application — what each one " +
+      "pulls from, which index it writes, whether it is enabled, its schedule, and " +
+      "when it last ran and next runs. A task is a configured pipeline (source → " +
+      "transformation → index), so running one is how an index gets rebuilt the way " +
+      "somebody set it up. Start here when a record exists in the source system and " +
+      "search cannot find it: a `last_run` older than the record is the whole answer.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        enabled: { type: "boolean", description: "Only enabled, or only disabled, tasks." },
+      },
+    },
+  },
+  run_task: {
+    run: runTask,
+    description:
+      "Trigger an ingestion task now and WAIT for the run to finish, then say whether " +
+      "it succeeded. **This is the right way to refresh an index that has a connector " +
+      "task** — it uses the pipeline somebody configured, including whatever " +
+      "transformation it applies, and the next scheduled run agrees with it instead of " +
+      "overwriting what you pushed. Prefer it over refresh_index whenever list_tasks " +
+      "shows a task writing the index in question. A run that outlasts `wait_seconds` " +
+      "is reported as still running with its run_id — that is not a failure, and " +
+      "triggering a second run on top of the first is the wrong response to it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "From list_tasks." },
+        wait_seconds: {
+          type: "number",
+          description: "How long to wait for the run to finish. Default 300.",
+        },
+      },
+      required: ["task_id"],
+    },
+  },
+  run_status: {
+    run: runStatus,
+    description:
+      "Where an ingestion run got to, by run_id — for one that outlasted run_task's " +
+      "wait. `status` is created/started/finished/skipped and `outcome` is " +
+      "success/failure; a skipped run means the connector decided there was nothing " +
+      "to ingest and the index was NOT rebuilt.",
+    inputSchema: {
+      type: "object",
+      properties: { run_id: { type: "string" } },
+      required: ["run_id"],
+    },
+  },
   list_indices: {
     run: listIndices,
     description:
@@ -502,13 +785,18 @@ const TOOLS = {
     run: refreshIndex,
     description:
       "Replace an index's entire contents from a JSON feed, atomically, and wait " +
-      "until it has published. This is the fix for an index that ingests on a " +
-      "schedule and has not caught up — on the Proluxe ERP, index `part_costs` " +
-      "from feed https://api.proluxe.com/algolia/parts (and catalog, customers, " +
-      "contacts, vendors, products from the matching /algolia/* paths). Settings, " +
-      "synonyms and ranking rules are carried over, and search never sees a " +
-      "half-filled index. Pass `dry_run` to count the feed without writing — the " +
-      "way to tell a bad feed from a stale index.",
+      "until it has published. **Check list_tasks first**: if a connector task " +
+      "writes this index, use run_task instead — this pushes records straight past " +
+      "the pipeline, knows nothing about the transformation it applies, and the next " +
+      "scheduled run will overwrite whatever you put here. Use this when there is no " +
+      "task for the index, or when the connector itself is the thing that is broken. " +
+      "On the Proluxe ERP the feeds are https://api.proluxe.com/Common/algolia/parts " +
+      "(and catalog, customers, contacts, vendors, products from the matching " +
+      "/Common/algolia/* paths) — note the /Common prefix; the bare /algolia/* path " +
+      "answers 404 \"Unknown app\". Settings, synonyms and ranking rules are carried " +
+      "over, and search never sees a half-filled index. Pass `dry_run` to count the " +
+      "feed without writing — the way to tell a bad feed from a stale index, and the " +
+      "one call here that needs no Algolia credentials at all.",
     inputSchema: {
       type: "object",
       properties: {
@@ -607,7 +895,7 @@ export function __resetTokenCache() {
   tokenCache = null;
 }
 
-export { TOOLS, credentials, fetchFeed };
+export { TOOLS, credentials, fetchFeed, summariseRun };
 
 if (process.env.LEO_MCP_NO_SERVE !== "1") {
   await server.connect(new StdioServerTransport());
