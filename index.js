@@ -360,23 +360,35 @@ async function fetchFeed(url, auth) {
 async function refreshIndex({ index, feed_url, object_id_field, dry_run, feed_auth }) {
   if (!index) throw new Error("refresh_index requires `index`.");
   if (!feed_url) throw new Error("refresh_index requires `feed_url`.");
-  const creds = credentials();
 
+  // The feed FIRST, and the Algolia credentials only when about to write.
+  // `dry_run` exists to answer "is the feed the problem or the index?", and
+  // demanding a write key to answer it made the one diagnostic that needs no
+  // permissions the one nobody without permissions could run.
   const raw = await fetchFeed(feed_url, feed_auth);
   const records = withObjectIds(raw, object_id_field);
 
-  // Read the count first so the answer can say what changed rather than just
-  // what it wrote — "4,312 → 4,313" is the sentence somebody wanted.
-  let before = null;
+  let creds = null;
   try {
-    const existing = await call(creds, {
-      path: `/1/indexes/${encodeURIComponent(index)}`,
-    });
-    before = existing?.entries ?? null;
-  } catch {
-    // A brand-new index has no settings object yet, which is not an error
-    // here: the move at step 3 creates it.
-    before = null;
+    creds = credentials();
+  } catch (error) {
+    if (!dry_run) throw error;
+  }
+
+  // Read the count so the answer can say what changed rather than just what it
+  // wrote — "4,312 → 4,313" is the sentence somebody wanted.
+  let before = null;
+  if (creds) {
+    try {
+      const existing = await call(creds, {
+        path: `/1/indexes/${encodeURIComponent(index)}`,
+      });
+      before = existing?.entries ?? null;
+    } catch {
+      // A brand-new index has no settings object yet, which is not an error
+      // here: the move at step 3 creates it.
+      before = null;
+    }
   }
 
   if (dry_run) {
@@ -386,7 +398,13 @@ async function refreshIndex({ index, feed_url, object_id_field, dry_run, feed_au
       records_in_feed: records.length,
       records_in_index: before,
       sample: records.slice(0, 3),
-      note: "Nothing was written. Drop `dry_run` to replace the index.",
+      note:
+        "Nothing was written. Drop `dry_run` to replace the index." +
+        (creds
+          ? ""
+          : " `records_in_index` is null because no Algolia credentials are " +
+            "configured — the feed was read and is fine, which is what a dry run " +
+            "is for."),
     };
   }
 

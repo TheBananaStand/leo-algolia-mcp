@@ -425,6 +425,41 @@ await test("writes go to the write host, reads to -dsn", () =>
     }
   }));
 
+await test("dry_run reads the feed with no Algolia credentials at all", () =>
+  withEnv({ algolia_app_id: undefined, algolia_admin_api_key: undefined }, async () => {
+    // The one diagnostic that needs no permissions must not require the key
+    // with the most. Demanding a write key to answer "is the feed the problem
+    // or the index?" made it unrunnable by exactly the person asking.
+    const stub = stubFetch([{ match: "/feed", body: [{ objectID: "a" }, { objectID: "b" }] }]);
+    try {
+      const out = await TOOLS.refresh_index.run({
+        index: "part_costs", feed_url: "https://api.example.com/feed",
+        feed_auth: false, dry_run: true,
+      });
+      assert.equal(out.records_in_feed, 2);
+      assert.equal(out.records_in_index, null);
+      assert.match(out.note, /no Algolia credentials/);
+    } finally {
+      stub.restore();
+    }
+  }));
+
+await test("a real refresh still refuses without credentials", () =>
+  withEnv({ algolia_admin_api_key: undefined }, async () => {
+    // The permissive read above must not have loosened the write.
+    const stub = stubFetch([{ match: "/feed", body: [{ objectID: "a" }] }]);
+    try {
+      await assert.rejects(
+        TOOLS.refresh_index.run({
+          index: "part_costs", feed_url: "https://api.example.com/feed", feed_auth: false,
+        }),
+        /algolia_admin_api_key/,
+      );
+    } finally {
+      stub.restore();
+    }
+  }));
+
 await test("dry_run writes nothing and still counts both sides", () =>
   withEnv({}, async () => {
     const stub = stubFetch(refreshHandlers());
